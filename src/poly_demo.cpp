@@ -15,7 +15,17 @@
 #include "Surface/PolySimpleLaplace.h"
 #include "Surface/PolySmoothing.h"
 #include "Surface/SpectralProcessing.h"
+#include <Spectra/MatOp/SparseSymMatProd.h>
+#include <Spectra/SymEigsSolver.h>
+#include <Spectra/MatOp/SparseSymShiftSolve.h>
+#include <Spectra/SymEigsShiftSolver.h>
+#include <Spectra/MatOp/SparseCholesky.h>
+
 using namespace pmp;
+
+#include <algorithm>
+#include <tuple>
+#include <numeric> // for iota
 
 //=============================================================================
 
@@ -35,6 +45,13 @@ private:
     double min_cond = -1, max_cond = -1;
     bool show_uv_layout_;
     int mesh_index_ = 0;
+
+public:
+    void apply_selective_trace_optimization(int laplace,
+                                            int baseline_min_point,
+                                            double fraction_to_optimize,
+                                            bool compute_global_cond = true);
+
 };
 
 
@@ -146,6 +163,23 @@ void Viewer::process_imgui()
             set_draw_mode("Hidden Line");
         }
 
+        // inside ImGui::CollapsingHeader("Make it robust", ...)
+        static float select_fraction = 0.05f; // default 5%
+        ImGui::PushItemWidth(150);
+        ImGui::SliderFloat("Fraction to optimize", &select_fraction, 0.0f, 1.0f, "%.2f");
+        ImGui::Text("Selected fraction: %.0f%%", select_fraction * 100.0f);
+        ImGui::PopItemWidth();
+        if (ImGui::Button("Apply Selective Trace Optimization"))
+        {
+            apply_selective_trace_optimization(laplace, AreaMinimizer, select_fraction, true);
+            renderer_.set_specular(0);
+            // update_mesh() is called at the end of the function already, but safe to call again
+            update_mesh();
+            set_draw_mode("Hidden Line");
+        }
+
+
+
         ImGui::Unindent(10);
     }
 
@@ -239,6 +273,210 @@ void Viewer::process_imgui()
         ImGui::Unindent(10);
     }
 }
+void Viewer::apply_selective_trace_optimization(int laplace,
+                                                int baseline_min_point,
+                                                double fraction_to_optimize,
+                                                bool compute_global_cond)
+{
+    using Triplet = Eigen::Triplet<double>;
+
+    int F = mesh_.n_faces();
+
+    // get or create face properties
+    auto face_impr = mesh_.face_property<double>("f:improvement");
+    if (!face_impr)
+        face_impr = mesh_.add_face_property<double>("f:improvement");
+
+    auto face_color = mesh_.face_property<Color>("f:color");
+    if (!face_color)
+        face_color = mesh_.add_face_property<Color>("f:color");
+
+    struct FaceInfo
+    {
+        Face f;
+        double delta;
+        Eigen::MatrixXd S_baseline;
+        Eigen::MatrixXd S_trace;
+        std::vector<int> vidx;
+    };
+
+    std::vector<FaceInfo> finfos;
+    finfos.reserve(F);
+
+    // 1) per-face baseline/trace stiffness and improvement
+    for (auto f : mesh_.faces())
+    {
+        Eigen::MatrixXd poly;
+        get_polygon_from_face(mesh_, f, poly); // repo helper
+
+        // baseline weights
+        Eigen::VectorXd w_baseline;
+        if (baseline_min_point == Centroid_)
+        {
+            int val = (int)poly.rows();
+            w_baseline = Eigen::VectorXd::Ones(val);
+            w_baseline /= (double)val;
+        }
+        else
+        {
+            find_area_minimizer_weights(poly, w_baseline);
+        }
+
+        Eigen::Vector3d v_baseline = poly.transpose() * w_baseline;
+
+        // baseline local stiffness
+        Eigen::MatrixXd Si_baseline;
+        localCotanMatrix(poly, v_baseline, w_baseline, Si_baseline);
+
+        // trace-minimizer
+        Eigen::VectorXd w_trace;
+        find_trace_minimizer_weights(poly, w_trace);
+        Eigen::Vector3d v_trace = poly.transpose() * w_trace;
+
+        Eigen::MatrixXd Si_trace;
+        localCotanMatrix(poly, v_trace, w_trace, Si_trace);
+
+        double tr_baseline = Si_baseline.trace();
+        double tr_trace = Si_trace.trace();
+        double delta = (tr_baseline > 1e-18) ? (tr_baseline - tr_trace) / tr_baseline : 0.0;
+
+        // collect vertex indices in face order
+        std::vector<int> vidx;
+        auto h0 = mesh_.halfedge(f);
+        auto h = h0;
+        do {
+            vidx.push_back(mesh_.to_vertex(h).idx());
+            h = mesh_.next_halfedge(h);
+        } while (h != h0);
+
+        finfos.push_back({f, delta, Si_baseline, Si_trace, vidx});
+    }
+
+    // check one sample face for debugging
+    if (!finfos.empty()) {
+        auto &fi = finfos[0];
+        std::cout << "[DBG] sample face idx=" << fi.f.idx()
+                  << " delta=" << fi.delta
+                  << " tr_base=" << fi.S_baseline.trace()
+                  << " tr_trace=" << fi.S_trace.trace() << std::endl;
+    }
+
+    // write improvement prop (and compute max for normalization)
+    double max_impr = 0.0;
+    for (auto &fi : finfos) {
+        face_impr[fi.f] = fi.delta;
+        max_impr = std::max(max_impr, fi.delta);
+    }
+
+    // sort faces by delta
+    std::vector<int> idxs(finfos.size());
+    std::iota(idxs.begin(), idxs.end(), 0);
+    std::stable_sort(idxs.begin(), idxs.end(),
+                     [&](int a, int b){ return finfos[a].delta > finfos[b].delta; });
+
+    int K = std::max(1, (int)std::round((double)finfos.size() * fraction_to_optimize));
+    std::vector<char> use_trace_mask(finfos.size(), 0);
+    for (int i = 0; i < K; ++i) use_trace_mask[idxs[i]] = 1;
+
+    std::cout << "[STO] Faces total: " << finfos.size()
+              << "  Selected K: " << K
+              << " (fraction=" << fraction_to_optimize << ")\n";
+
+    // color faces by improvement (normalized)
+    for (size_t i = 0; i < finfos.size(); ++i)
+    {
+        double d = finfos[i].delta;
+        double norm = (max_impr > 0.0) ? (d / max_impr) : 0.0;
+        if (use_trace_mask[i])
+            face_color[finfos[i].f] = Color(1.0, 0.0, 1.0); // magenta = selected
+        else
+            face_color[finfos[i].f] = Color(0.2 + 0.6*norm, 0.6 - 0.4*norm, 0.9 - 0.6*norm);
+    }
+
+    // assemble global stiffness
+    int nVerts = mesh_.n_vertices();
+    std::vector<Triplet> triplets;
+    triplets.reserve(finfos.size() * 9);
+
+    for (size_t i = 0; i < finfos.size(); ++i)
+    {
+        const FaceInfo& fi = finfos[i];
+        const std::vector<int>& vids = fi.vidx;
+        int n = (int)vids.size();
+        const Eigen::MatrixXd& Slocal = use_trace_mask[i] ? fi.S_trace : fi.S_baseline;
+
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c)
+            {
+                double v = Slocal(r, c);
+                if (std::abs(v) > 1e-16)
+                    triplets.emplace_back(vids[r], vids[c], v);
+            }
+    }
+
+    Eigen::SparseMatrix<double> S_global(nVerts, nVerts);
+    S_global.setFromTriplets(triplets.begin(), triplets.end());
+    // enforce symmetry
+    Eigen::SparseMatrix<double> S_sym = 0.5 * (S_global + Eigen::SparseMatrix<double>(S_global.transpose()));
+    S_sym.makeCompressed();
+
+    if (compute_global_cond)
+    {
+        bool firstEigZero = false;
+        double cond_after = get_condition_number(-S_sym, firstEigZero);
+
+        // baseline global
+        std::vector<Triplet> triplets_base;
+        for (auto &fi : finfos)
+        {
+            const std::vector<int>& vids = fi.vidx;
+            int n = (int)vids.size();
+            for (int r = 0; r < n; ++r)
+                for (int c = 0; c < n; ++c)
+                {
+                    double vv = fi.S_baseline(r, c);
+                    if (std::abs(vv) > 1e-16)
+                        triplets_base.emplace_back(vids[r], vids[c], vv);
+                }
+        }
+        Eigen::SparseMatrix<double> S_base(nVerts, nVerts);
+        S_base.setFromTriplets(triplets_base.begin(), triplets_base.end());
+        S_base.makeCompressed();
+        Eigen::SparseMatrix<double> S_base_sym = 0.5 * (S_base + Eigen::SparseMatrix<double>(S_base.transpose()));
+        S_base_sym.makeCompressed();
+
+        double cond_base = get_condition_number(-S_base_sym, firstEigZero);
+
+        // helper to query few extremal eigenvalues using Spectra
+        auto print_extremal_eigs = [&](const Eigen::SparseMatrix<double>& A, const std::string& name){
+            using OpType = Spectra::SparseSymMatProd<double>;
+            OpType op(A);
+            int nev = 3;
+            int ncv = std::min((int)A.rows(), 6*nev);
+            Spectra::SymEigsSolver<OpType> eigs(op, nev, ncv);
+            eigs.init();
+            eigs.compute(Spectra::SortRule::LargestAlge);
+            Eigen::VectorXd largest = eigs.eigenvalues();
+            std::cout << "[EIG] " << name << " largest: ";
+            for (int i=0;i<largest.size();++i) std::cout << largest[i] << " ";
+            std::cout << "\n";
+        };
+
+        print_extremal_eigs(S_base_sym, "S_base_sym");
+        print_extremal_eigs(S_sym, "S_sym");
+
+        std::cout << "Selective Trace Optimized faces: " << K << " / " << finfos.size() << std::endl;
+        std::cout << "Global condition baseline: " << cond_base << std::endl;
+        std::cout << "Global condition after selective trace: " << cond_after << std::endl;
+        if (cond_base > 0.0)
+            std::cout << "Relative improvement: " << (cond_base - cond_after) / cond_base * 100.0 << " %\n";
+    }
+
+    update_mesh();
+    set_draw_mode("Hidden Line");
+}
+
+
 
 void Viewer::color_code_condition_numbers(int laplace, int min_point)
 {
