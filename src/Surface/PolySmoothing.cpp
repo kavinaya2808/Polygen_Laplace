@@ -44,7 +44,8 @@ PolySmoothing::PolySmoothing(SurfaceMesh& mesh, SmoothingConfigs oConf)
     is2D_ = bb.min()[2] == bb.max()[2];
 
     setupQuadrics();
-    computeVirtualVertices();
+    if (!oConf_.lockFaceVirtuals)
+        computeVirtualVertices();
     if (oConf_.fixBoundary)
     {
         auto originalPosition =
@@ -158,7 +159,8 @@ void PolySmoothing::optimize(int quadricsTau)
             mesh_.position(v) = p;
         });
 
-        computeVirtualVertices(false);
+        if (!oConf_.lockFaceVirtuals)
+            computeVirtualVertices(false);
 
         if (i && oConf_.updateQuadrics)
             setupQuadrics();
@@ -178,6 +180,15 @@ void PolySmoothing::optimize(int quadricsTau)
 void PolySmoothing::computeVirtualVertices(bool use_fallback)
 {
     auto faceVirtuals = mesh_.face_property<Eigen::Vector3d>("f:Virtuals");
+    if (!faceVirtuals)
+        faceVirtuals = mesh_.add_face_property<Eigen::Vector3d>("f:Virtuals");
+
+    // If the caller requested "lock face virtuals", do not overwrite them.
+    if (oConf_.lockFaceVirtuals) {
+        // In STO mode, virtuals must already be set by caller (viewer/UI)
+        return;
+    }
+
     Eigen::MatrixXd poly;
     Eigen::Vector3d vV;
     Eigen::VectorXd weights;
@@ -185,11 +196,13 @@ void PolySmoothing::computeVirtualVertices(bool use_fallback)
     for (auto f : mesh_.faces())
     {
         get_polygon_from_face(mesh_, f, poly);
+        // default behaviour: use trace minimizer
         find_trace_minimizer_weights(poly, weights, use_fallback);
         vV = poly.transpose() * weights;
         faceVirtuals[f] = vV;
     }
 }
+
 
 void PolySmoothing::setupQuadrics()
 {

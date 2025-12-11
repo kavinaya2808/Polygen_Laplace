@@ -14,7 +14,7 @@ if (EMSCRIPTEN)
 
 else ()
 
-    add_executable(poly_demo poly_demo.cpp)
+    add_executable(poly_demo poly_demo.cpp io_utils.cpp)
     target_link_libraries(poly_demo poly)
 
     add_executable(run_volume_tests run_volume_tests.cpp)

@@ -22,6 +22,7 @@
 #include "Spectra/SymEigsSolver.h"
 #include <iomanip>
 
+
 //=============================================================================
 
 using namespace pmp;
@@ -542,4 +543,263 @@ double get_condition_number(const Eigen::SparseMatrix<double>& M,
               << std::endl;
     return eigValsMax.coeff(0) /
            eigValsMin.coeff(numEigValues - 1 - (firstEigZero));
+}
+
+
+double compute_condition_number(const Eigen::SparseMatrix<double>& A_in)
+{
+    using OpType = Spectra::SparseSymMatProd<double>;
+
+    const int n = (int)A_in.rows();
+    if (n == 0 || A_in.cols() != A_in.rows())
+        return std::numeric_limits<double>::infinity();
+
+    Eigen::SparseMatrix<double> B = A_in;
+    B.makeCompressed();
+
+    // --- 1) compute largest algebraic eigenvalue ---
+    auto compute_largest = [&](const Eigen::SparseMatrix<double>& M)->std::pair<double,bool>{
+        OpType op(M);
+        int nev = 1;
+        int ncv = std::min((int)M.rows(), std::max(40, 8 * nev));
+        Spectra::SymEigsSolver<OpType> eigs(op, nev, ncv);
+        eigs.init();
+        eigs.compute(Spectra::SortRule::LargestAlge);
+        if (eigs.info() != Spectra::CompInfo::Successful) return {0.0, false};
+        return {eigs.eigenvalues()[0], true};
+    };
+
+    auto [lambda_max_raw, ok_max] = compute_largest(B);
+    if (!ok_max) return std::numeric_limits<double>::infinity();
+
+    // --- 2) compute several smallest algebraic eigenvalues (we'll use them to decide sign and pick min) ---
+    int nev_min = std::min(5, std::max(1, (int)B.rows()));
+    int ncv_min = std::min((int)B.rows(), std::max(20, 6 * nev_min));
+    OpType op_min(B);
+    Spectra::SymEigsSolver<OpType> eigs_min(op_min, nev_min, ncv_min);
+    eigs_min.init();
+    eigs_min.compute(Spectra::SortRule::SmallestAlge);
+
+    std::vector<double> small_eigs;
+    if (eigs_min.info() == Spectra::CompInfo::Successful) {
+        Eigen::VectorXd vals = eigs_min.eigenvalues();
+        small_eigs.resize(vals.size());
+        for (int i=0;i<vals.size();++i) small_eigs[i] = vals[i];
+    }
+
+    // --- 3) decide sign robustly and flip B if it looks negative-semidefinite ---
+    // Criteria:
+    //  - lambda_max_raw is very small (near zero), *and*
+    //  - we find negative small eigenvalues (algebraic min < -threshold)
+    //
+    // thresholds:
+    double sign_eps_abs = 1e-12; // absolute threshold for lambda_max being "tiny"
+    double neg_eig_threshold = 1e-8; // consider a small_eig << -neg_eig_threshold as clearly negative
+
+    bool looks_negative_semidef = false;
+    if (!small_eigs.empty()) {
+        // if algebraic smallest is significantly negative and lambda_max is ~0 -> negative-semidef
+        if (small_eigs[0] < -neg_eig_threshold && std::abs(lambda_max_raw) < sign_eps_abs) {
+            looks_negative_semidef = true;
+        }
+        // also if many of the sampled small_eigs are negative -> negative
+        int neg_count = 0;
+        for (double v : small_eigs) if (v < -neg_eig_threshold) ++neg_count;
+        if (neg_count >= (int)std::ceil(0.5 * (double)small_eigs.size())) looks_negative_semidef = true;
+    } else {
+        // if Spectra failed to compute small eigs but largest is extremely small, assume negative/degenerate
+        if (std::abs(lambda_max_raw) < sign_eps_abs) looks_negative_semidef = true;
+    }
+
+    double lambda_max = lambda_max_raw;
+    if (looks_negative_semidef || lambda_max_raw <= 0.0) {
+        // flip sign and recompute lambda_max on flipped matrix
+        B = -B;
+        B.makeCompressed();
+        std::tie(lambda_max, ok_max) = compute_largest(B);
+        if (!ok_max) return std::numeric_limits<double>::infinity();
+        if (lambda_max <= 0.0) {
+            // degenerate after flipping too
+            return std::numeric_limits<double>::infinity();
+        }
+
+        // recompute small_eigs on flipped matrix (optional but safer)
+        OpType op_min2(B);
+        Spectra::SymEigsSolver<OpType> eigs_min2(op_min2, nev_min, ncv_min);
+        eigs_min2.init();
+        eigs_min2.compute(Spectra::SortRule::SmallestAlge);
+        small_eigs.clear();
+        if (eigs_min2.info() == Spectra::CompInfo::Successful) {
+            Eigen::VectorXd vals2 = eigs_min2.eigenvalues();
+            small_eigs.resize(vals2.size());
+            for (int i=0;i<vals2.size();++i) small_eigs[i] = vals2[i];
+        }
+    } else {
+        // use lambda_max as computed
+        lambda_max = lambda_max_raw;
+    }
+
+    // --- 4) pick a robust lambda_min (smallest positive above eps_pos), fallback to clamp ---
+    double eps_pos = std::max(1e-14, std::abs(lambda_max) * 1e-13);
+    double lambda_min = 0.0;
+    bool found_pos = false;
+    for (double ev : small_eigs) {
+        if (ev > eps_pos) {
+            if (!found_pos) { lambda_min = ev; found_pos = true; }
+            else lambda_min = std::min(lambda_min, ev);
+        }
+    }
+
+    if (!found_pos) {
+        if (!small_eigs.empty()) {
+            double algebraic_min = small_eigs[0];
+            double tol = std::max(1e-14, std::abs(lambda_max) * 1e-12);
+            if (algebraic_min > tol) lambda_min = algebraic_min;
+            else lambda_min = tol;
+        } else {
+            lambda_min = std::max(1e-14, std::abs(lambda_max) * 1e-12);
+        }
+    }
+
+    double cond = std::abs(lambda_max) / std::abs(lambda_min);
+
+    if (cond > 1e10 || cond < 1.0) { // print only extremely suspicious cases
+        std::ostringstream oss;
+        oss << "[CONDDBG] n=" << n
+            << " lambda_max=" << lambda_max
+            << " small_eigs:";
+        for (double v : small_eigs) oss << " " << v;
+        oss << " chosen_lambda_min=" << lambda_min
+            << " eps_pos=" << eps_pos
+            << " cond=" << cond << "\n";
+        std::cerr << oss.str();
+    }
+
+    if (!std::isfinite(cond)) return std::numeric_limits<double>::infinity();
+    return cond;
+}
+
+
+std::tuple<double,double,double> compute_generalized_spectral_metrics(
+    const Eigen::SparseMatrix<double>& S_in,
+    const Eigen::SparseMatrix<double>& M_in)
+{
+    Eigen::SparseMatrix<double> S = S_in; S.makeCompressed();
+    Eigen::SparseMatrix<double> M = M_in; M.makeCompressed();
+
+    int n = (int)S.rows();
+    if (n == 0 || M.rows() != n || M.cols() != n) {
+        return {std::nan(""), std::nan(""), std::numeric_limits<double>::infinity()};
+    }
+
+    try {
+        // 1) try a safe (regularized) approach to estimate lam_max:
+        double lam_max = std::nan("");
+        // try generalized cholesky-based largest eigenvalue if M is reasonably positive-definite
+        try {
+            Spectra::SparseSymMatProd<double> sOp(-S);
+            Spectra::SparseCholesky<double> sB(M);
+            int nev_max = 1;
+            int ncv_max = std::min(n, std::max(40, 8 * nev_max));
+            Spectra::SymGEigsSolver<Spectra::SparseSymMatProd<double>,
+                                     Spectra::SparseCholesky<double>,
+                                     Spectra::GEigsMode::Cholesky>
+                geigs_max(sOp, sB, nev_max, ncv_max);
+            geigs_max.init();
+            geigs_max.compute(Spectra::SortRule::LargestAlge);
+            if (geigs_max.info() == Spectra::CompInfo::Successful) lam_max = geigs_max.eigenvalues()[0];
+        } catch (...) {
+            // fallback to a power-type iteration (solve M z = S x)
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solverM;
+            solverM.compute(M);
+            if (solverM.info() == Eigen::Success) {
+                Eigen::VectorXd x = Eigen::VectorXd::Random(n); x.normalize();
+                double last_lambda = 0.0;
+                for (int it = 0; it < 200; ++it) {
+                    Eigen::VectorXd y = S * x;
+                    Eigen::VectorXd z = solverM.solve(y);
+                    if (solverM.info() != Eigen::Success) break;
+                    double lambda = x.dot(z);
+                    double normz = z.norm();
+                    if (normz == 0.0) break;
+                    x = z / normz;
+                    if (it > 5 && std::abs(lambda - last_lambda) / (1.0 + std::abs(last_lambda)) < 1e-12) {
+                        lam_max = std::abs(lambda);
+                        break;
+                    }
+                    last_lambda = lambda;
+                }
+                if (!std::isfinite(lam_max)) lam_max = std::abs(last_lambda);
+            }
+        }
+
+        // second fallback: if lam_max still NaN, try simple Spectra on -S alone
+        if (!std::isfinite(lam_max)) {
+            try {
+                Spectra::SparseSymMatProd<double> opS(-S);
+                int nev = 1;
+                int ncv = std::min(n, std::max(40, 8 * nev));
+                Spectra::SymEigsSolver<Spectra::SparseSymMatProd<double>> eigs(opS, nev, ncv);
+                eigs.init();
+                eigs.compute(Spectra::SortRule::LargestAlge);
+                if (eigs.info() == Spectra::CompInfo::Successful) lam_max = eigs.eigenvalues()[0];
+            } catch (...) {}
+        }
+
+        // 2) attempt to compute smallest non-zero generalized eigenvalue via shift-invert
+        double lam_min_nonzero = std::nan("");
+        std::vector<double> reg_eps = {0.0, 1e-16, 1e-14, 1e-12, 1e-10, 1e-8};
+        for (double eps : reg_eps) {
+            try {
+                Eigen::SparseMatrix<double> Mreg = M;
+                if (eps > 0.0) {
+                    for (int k=0;k<Mreg.rows();++k) Mreg.coeffRef(k,k) += eps;
+                    Mreg.makeCompressed();
+                }
+
+                Spectra::SymShiftInvert<double, Eigen::Sparse, Eigen::Sparse> shiftOp(-S, Mreg);
+                Spectra::SparseSymMatProd<double> bOp(Mreg);
+
+                int nev_min = std::min(6, std::max(2, n/10));
+                int ncv_min = std::min(n, std::max(20, 6 * nev_min));
+                int kreq = std::min(nev_min, std::max(1, n-1));
+
+                Spectra::SymGEigsShiftSolver< Spectra::SymShiftInvert<double, Eigen::Sparse, Eigen::Sparse>,
+                                              Spectra::SparseSymMatProd<double>,
+                                              Spectra::GEigsMode::ShiftInvert >
+                    geigs_min(shiftOp, bOp, kreq, ncv_min, 0.0);
+                geigs_min.init();
+                geigs_min.compute(Spectra::SortRule::LargestMagn);
+                if (geigs_min.info() == Spectra::CompInfo::Successful) {
+                    Eigen::VectorXd vals = geigs_min.eigenvalues();
+                    double eps_rel = std::max(1e-14, (std::isfinite(lam_max) ? std::abs(lam_max) * 1e-12 : 1e-14));
+                    std::vector<double> nonzeros;
+                    for (int i=0;i<vals.size();++i) if (std::abs(vals[i]) > eps_rel) nonzeros.push_back(std::abs(vals[i]));
+                    if (!nonzeros.empty()) {
+                        std::sort(nonzeros.begin(), nonzeros.end());
+                        lam_min_nonzero = nonzeros.front();
+                        break;
+                    } else if (vals.size() > 0) {
+                        lam_min_nonzero = std::abs(vals[0]);
+                        break;
+                    }
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "[compute_generalized_spectral_metrics] Spectra attempt eps=" << eps << " exception: " << e.what() << std::endl;
+                // keep trying other eps
+            } catch (...) {
+                // keep trying
+            }
+        }
+
+        double kappa = std::numeric_limits<double>::infinity();
+        if (std::isfinite(lam_max) && std::isfinite(lam_min_nonzero) && lam_min_nonzero > 0.0) {
+            kappa = std::abs(lam_max / lam_min_nonzero);
+        }
+
+        return {lam_min_nonzero, lam_max, kappa};
+    } catch (const std::exception &e) {
+        std::cerr << "[compute_generalized_spectral_metrics] exception: " << e.what() << std::endl;
+        return {std::nan(""), std::nan(""), std::numeric_limits<double>::infinity()};
+    }
 }

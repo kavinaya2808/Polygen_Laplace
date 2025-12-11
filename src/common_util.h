@@ -37,18 +37,24 @@ public:
     explicit SmoothingConfigs(int numIters, bool fixBoundary = false,
                               bool updateQuadrics = false,
                               bool withCnum = false,
-                              bool generalizedCnum = false)
+                              bool generalizedCnum = false,
+                              bool lockFaceVirtuals = false)
         : numIters(numIters),
           fixBoundary(fixBoundary),
           updateQuadrics(updateQuadrics),
           withCnum(withCnum),
-          generalizedCnum(generalizedCnum){};
+          generalizedCnum(generalizedCnum),
+          lockFaceVirtuals(lockFaceVirtuals) {};
 
     int numIters;
     bool fixBoundary;
     bool updateQuadrics;
     bool withCnum;
     bool generalizedCnum;
+
+    bool lockFaceVirtuals; // if true, do not recompute f:Virtuals inside PolySmoothing
+    bool useSTO;           // optional semantic: mark that STO was used
+    double sto_fraction;   
 };
 
 #endif
